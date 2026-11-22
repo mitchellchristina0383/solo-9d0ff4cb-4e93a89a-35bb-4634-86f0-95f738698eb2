@@ -45,8 +45,12 @@ class Storage:
         self.conn.commit()
         if self.get_setting("check_time") is None:
             self.set_setting("check_time", DEFAULT_CHECK_TIME)
-        if self.get_setting("clock_offset_seconds") is None:
-            self.set_setting("clock_offset_seconds", "0")
+        # 演练时钟只存在于本场内存；旧版本落库的偏移一律清除并忽略，
+        # 保证重启后回到正式模式。
+        self.conn.execute(
+            "DELETE FROM settings WHERE key='clock_offset_seconds'"
+        )
+        self.conn.commit()
 
     # ---- settings -------------------------------------------------------
     def get_setting(self, key: str) -> Optional[str]:

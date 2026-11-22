@@ -185,7 +185,16 @@ class SchedulerPlanTest(unittest.TestCase):
         sch, storage, clock, tmpdir = make_scheduler(
             datetime(2026, 6, 15, 13, 0), reader=reader1
         )
-        t = run_tick_in_thread(sch)
+
+        def tick_survives_kill():
+            # 模拟进程在读盘中被杀死：DB 已关闭，晚到的写回失败。
+            try:
+                sch.tick()
+            except Exception:
+                pass
+
+        t = threading.Thread(target=tick_survives_kill, daemon=True)
+        t.start()
         self.assertTrue(reader1.entered.wait(5))
         db_path = storage.path
         plan_before = storage.get_plan("2026-06-15")
@@ -256,21 +265,16 @@ class SchedulerPlanTest(unittest.TestCase):
             datetime(2026, 11, 1, 5, 30, tzinfo=UTC),
         )
 
-    def test_drill_clock_advance_and_set_persist(self):
+    def test_scheduler_uses_injected_clock(self):
+        # 调度器只认注入时钟；演练偏移由 DrillClock 包装提供（见 test_drill）。
         sch, storage, clock, _ = make_scheduler(datetime(2026, 6, 15, 12, 0))
-        sch.advance_clock(90)
-        self.assertEqual(
-            sch.now(), clock.now + timedelta(seconds=90)
-        )
-        sch.set_clock(datetime(2026, 6, 15, 20, 0, tzinfo=UTC))
+        self.assertEqual(sch.now(), clock.now)
+        clock.advance(90)
+        self.assertEqual(sch.now(), clock.now)
         self.assertEqual(
             sch.now_aware_utc(),
-            datetime(2026, 6, 15, 20, 0, tzinfo=UTC),
+            clock.now.replace(tzinfo=UTC),
         )
-        # 偏移已落库
-        self.assertNotEqual(storage.get_setting("clock_offset_seconds"), "0")
-        sch.reset_clock()
-        self.assertEqual(sch.now(), clock.now)
 
     def test_new_day_creates_new_plan_and_result_row(self):
         sch, storage, clock, _ = make_scheduler(

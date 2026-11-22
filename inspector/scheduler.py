@@ -6,14 +6,15 @@
 - 重启后补做当天已到计划时间但没有结果的巡检；
   重启前已开始（running）的巡检仍沿用原来的计划时间；
 - 同一当地日期只保留一份结果（见 Storage.save_result）；
-- 支持演练时钟：now() = 真实 UTC + 偏移量，偏移量持久化。
+- 调度器本身只认注入的时钟（生产用真实 UTC，演练用演练时钟）；
+  演练时钟不落库，重启后自然回到真实时间。
+- ``cancel()`` 用于演练退出：读盘晚到的结果直接丢弃，不写回。
 """
 from __future__ import annotations
 
-import os
 import shutil
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Callable, Optional
 
 from . import timeutil
@@ -28,13 +29,18 @@ def default_disk_reader(volume_path: str) -> int:
     return shutil.disk_usage(volume_path).free
 
 
+def real_utc_now() -> datetime:
+    """真实当前时间（naive UTC）。"""
+    return datetime.utcnow()
+
+
 class Scheduler:
     def __init__(self, storage: Storage,
                  volume_path: str,
                  disk_reader: DiskReader = default_disk_reader,
                  read_delay: float = 0.0,
                  poll_interval: float = 1.0,
-                 clock: Callable[[], datetime] = datetime.utcnow):
+                 clock: Callable[[], datetime] = real_utc_now):
         self.storage = storage
         self.volume_path = volume_path
         self.disk_reader = disk_reader
@@ -43,6 +49,7 @@ class Scheduler:
         self._clock = clock  # 返回 naive UTC，便于测试注入
         self.lock = threading.RLock()
         self._stop = threading.Event()
+        self._cancelled = threading.Event()
         self._wake = threading.Event()
         self.thread: Optional[threading.Thread] = None
         # 正在执行读盘的当地日期（内存态，重启即清空）。
@@ -50,36 +57,20 @@ class Scheduler:
         self._running_planned_utc: Optional[str] = None
         self._running_check_time: Optional[str] = None
 
-    # ---- 演练时钟 -------------------------------------------------------
+    # ---- 时间 -----------------------------------------------------------
+    def real_now(self) -> datetime:
+        """注入时钟的真实时间（naive UTC）。"""
+        return self._clock()
+
     def now(self) -> datetime:
-        """当前演练时间（naive UTC）。"""
-        offset = float(self.storage.get_setting("clock_offset_seconds") or 0)
-        return self._clock() + timedelta(seconds=offset)
+        """当前调度时间（naive UTC）。生产与演练都取决于注入的时钟。"""
+        return self._clock()
 
     def now_aware_utc(self) -> datetime:
         return self.now().replace(tzinfo=timeutil.UTC)
 
     def now_ny(self) -> datetime:
         return self.now_aware_utc().astimezone(timeutil.NY_TZ)
-
-    def set_clock(self, dt_utc: datetime) -> None:
-        """把演练时钟直接设定到某个 UTC 绝对时刻。"""
-        if dt_utc.tzinfo is not None:
-            dt_utc = dt_utc.astimezone(timeutil.UTC).replace(tzinfo=None)
-        offset = (dt_utc - self._clock()).total_seconds()
-        with self.lock:
-            self.storage.set_setting("clock_offset_seconds", str(offset))
-
-    def advance_clock(self, seconds: float) -> None:
-        """在当前演练时间基础上推进若干秒。"""
-        with self.lock:
-            offset = float(self.storage.get_setting("clock_offset_seconds") or 0)
-            self.storage.set_setting("clock_offset_seconds",
-                                     str(offset + seconds))
-
-    def reset_clock(self) -> None:
-        with self.lock:
-            self.storage.set_setting("clock_offset_seconds", "0")
 
     # ---- 巡检时刻设置 ---------------------------------------------------
     def set_check_time(self, hhmm: str) -> None:
@@ -112,16 +103,26 @@ class Scheduler:
         if self.thread and self.thread.is_alive():
             return
         self._stop.clear()
+        self._cancelled.clear()
         self.thread = threading.Thread(
             target=self._loop, name="inspection-scheduler", daemon=True
         )
         self.thread.start()
 
     def stop(self) -> None:
-        self._stop.set()
-        self._wake.set()
+        """停止调度线程（可等待）。"""
+        self._cancel_events()
         if self.thread:
             self.thread.join(timeout=5)
+
+    def cancel(self) -> None:
+        """非阻塞取消：立即停止后续 tick，读盘晚到的结果直接丢弃。"""
+        self._cancel_events()
+
+    def _cancel_events(self) -> None:
+        self._stop.set()
+        self._cancelled.set()
+        self._wake.set()
 
     def wake(self) -> None:
         """设置变更后唤醒循环，避免等待下一个轮询周期。"""
@@ -139,6 +140,8 @@ class Scheduler:
 
     def tick(self) -> None:
         """一次调度检查，独立成方法便于单元测试直接驱动。"""
+        if self._cancelled.is_set():
+            return
         with self.lock:
             now = self.now_aware_utc()
             today = now.astimezone(timeutil.NY_TZ).date().isoformat()
@@ -177,9 +180,14 @@ class Scheduler:
 
         # 读盘放在锁外：期间网页仍可修改时刻。
         if self.read_delay:
-            # 可配置延迟，方便演练“读盘期间改时刻”。
+            # 可配置延迟，方便演练“读盘期间改时刻/退出”。
             if self._stop.wait(timeout=self.read_delay):
+                self._abandon_read()
                 return
+        if self._cancelled.is_set() or self._stop.is_set():
+            self._abandon_read()
+            return
+
         finished_utc = timeutil.to_utc_iso(self.now_aware_utc())
         available: Optional[int] = None
         error: Optional[str] = None
@@ -189,6 +197,10 @@ class Scheduler:
             error = f"{type(exc).__name__}: {exc}"
 
         with self.lock:
+            if self._cancelled.is_set() or self._stop.is_set():
+                # 演练已退出：晚到的读盘结果直接丢弃。
+                self._clear_running()
+                return
             if self._running_date != today:
                 return  # 极端情况下已被其他流程取代，放弃写回
             self.storage.save_result(
@@ -203,9 +215,16 @@ class Scheduler:
             self.storage.mark_finished(
                 today, "error" if error else "done", finished_utc
             )
-            self._running_date = None
-            self._running_planned_utc = None
-            self._running_check_time = None
+            self._clear_running()
+
+    def _abandon_read(self) -> None:
+        with self.lock:
+            self._clear_running()
+
+    def _clear_running(self) -> None:
+        self._running_date = None
+        self._running_planned_utc = None
+        self._running_check_time = None
 
     # ---- 给网页的只读状态 ------------------------------------------------
     def status(self) -> dict:
@@ -222,8 +241,5 @@ class Scheduler:
                 "result": result,
                 "reading": self._running_date == today,
                 "volume_path": self.volume_path,
-                "clock_offset_seconds": float(
-                    self.storage.get_setting("clock_offset_seconds") or 0
-                ),
                 "recent": self.storage.list_recent_results(),
             }

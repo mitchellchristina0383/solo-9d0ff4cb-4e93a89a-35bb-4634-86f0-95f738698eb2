@@ -15,17 +15,21 @@
            gap: 16px; }
     .card { background: #fff; border-radius: 10px; padding: 18px 20px;
             box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+    .card.drill { border: 2px solid #f59f00; }
     .card h2 { margin: 0 0 12px; font-size: 16px; color: #243b53; }
+    .card h3 { margin: 18px 0 8px; font-size: 14px; color: #243b53; }
     dl { display: grid; grid-template-columns: 160px 1fr; gap: 6px 12px;
          margin: 0; font-size: 14px; }
     dt { color: #627d98; }
     dd { margin: 0; }
     form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    form.inline { display: inline-flex; }
     input, button { padding: 8px 10px; border-radius: 6px; border: 1px solid #bcccdc;
                     font-size: 14px; }
     button { background: #2563eb; color: #fff; border-color: #2563eb;
              cursor: pointer; }
     button.secondary { background: #486581; border-color: #486581; }
+    button.warn { background: #d9480f; border-color: #d9480f; }
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
     th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid #e4e7eb; }
     th { color: #627d98; font-weight: 600; }
@@ -39,6 +43,9 @@
     .pill.error { background: #ffe3e3; color: #862e2e; }
     .pill.running { background: #fff3bf; color: #7a4f01; }
     .pill.pending { background: #e7f5ff; color: #1864ab; }
+    .pill.live { background: #d3f9d8; color: #1b4332; }
+    .pill.drill { background: #ffe8cc; color: #8a3f00; }
+    .pill.idle { background: #e4e7eb; color: #486581; }
     .muted { color: #829ab1; font-size: 12px; }
     code { background: #f0f4f8; padding: 1px 5px; border-radius: 4px; }
   </style>
@@ -46,7 +53,11 @@
 <body>
 <header>
   <h1>服务卷每日巡检台</h1>
-  <div class="sub">按 America/New_York 当地时间每日巡检一次 · 卷路径 <code>{{ st.volume_path }}</code></div>
+  <div class="sub">
+    正式巡检按 America/New_York 真实时间每日一次 · 卷路径
+    <code>{{ production.status.volume_path }}</code>
+    {% if drill %}<span class="pill drill">演练进行中</span>{% endif %}
+  </div>
 </header>
 <main>
   {% with messages = get_flashed_messages(with_categories=true) %}
@@ -56,72 +67,103 @@
   {% endwith %}
 
   <section class="card">
-    <h2>当前时间（演练时钟）</h2>
-    <dl>
-      <dt>纽约当地时间</dt>
-      <dd>{{ st.now_ny.strftime('%Y-%m-%d %H:%M:%S %Z (UTC%z)') }}</dd>
-      <dt>演练偏移</dt>
-      <dd>{{ st.clock_offset_seconds | round(0) | int }} 秒
-        {% if st.clock_offset_seconds != 0 %}
-          <form method="post" action="{{ url_for('clock_reset') }}" style="display:inline">
-            <button class="secondary" type="submit">恢复真实时间</button>
-          </form>
-        {% endif %}
-      </dd>
-    </dl>
+    <h2>演练控制</h2>
+    {% if drill %}
+      <dl>
+        <dt>演练状态</dt>
+        <dd><span class="pill drill">进行中（本服务仅此一场）</span></dd>
+        <dt>开始于（真实纽约时间）</dt>
+        <dd>{{ drill.started_real_local }}</dd>
+        <dt>本场初始巡检时刻</dt>
+        <dd>{{ drill.status.check_time }}（取自开始时的正式设置）</dd>
+      </dl>
+      <form method="post" action="{{ url_for('drill_exit') }}" style="margin-top:12px">
+        <button class="warn" type="submit">退出演练</button>
+        <span class="muted">演练设置、计划与结果只属于本场；读盘进行中也可立即退出，晚到结果直接丢弃。</span>
+      </form>
+    {% else %}
+      <p class="muted" style="margin-top:0">
+        开始一场演练：使用空的演练记录，初始巡检时刻取正式设置，
+        不影响正在运行的正式巡检。
+      </p>
+      <form method="post" action="{{ url_for('drill_start') }}">
+        <button type="submit">开始演练</button>
+      </form>
+    {% endif %}
   </section>
 
   <section class="card">
-    <h2>每日巡检时刻</h2>
-    <form method="post" action="{{ url_for('update_check_time') }}">
-      <input type="time" name="check_time" value="{{ st.check_time }}" required>
-      <button type="submit">保存时刻</button>
+    <h2>正式巡检（真实纽约时间）</h2>
+    <dl>
+      <dt>当前纽约时间</dt>
+      <dd>{{ production.status.now_ny.strftime('%Y-%m-%d %H:%M:%S %Z (UTC%z)') }}</dd>
+      <dt>每日巡检时刻</dt>
+      <dd>{{ production.status.check_time }}</dd>
+    </dl>
+    <form method="post" action="{{ url_for('update_check_time') }}" style="margin-top:12px">
+      <input type="time" name="check_time" value="{{ production.status.check_time }}" required>
+      <button type="submit">保存正式时刻</button>
     </form>
     <p class="muted" style="margin-bottom:0">
       春季跳时跳过的时刻顺延到跳时后第一个有效分钟；秋季重复的时刻取第一次出现。
       读盘期间修改时刻不会打断正在进行的巡检，仅影响尚未开始的计划。
     </p>
-  </section>
 
-  <section class="card">
-    <h2>当天计划（{{ st.today }}）</h2>
-    {% if plan_view %}
+    <h3>当天计划（{{ production.status.today }}）</h3>
+    {% if production.plan %}
       <dl>
         <dt>计划时刻（当地）</dt>
-        <dd>{{ plan_view.planned_local }}
-          <span class="pill {{ plan_view.status }}">
-            {% if st.reading %}读盘中{% else %}
-              {{ {'pending':'待执行','running':'执行中','done':'已完成','error':'读盘失败'}.get(plan_view.status, plan_view.status) }}
-            {% endif %}
+        <dd>{{ production.plan.planned_local }}
+          <span class="pill {{ production.plan.status }}">
+            {% if production.status.reading %}读盘中{% else %}{{ production.plan.status_label }}{% endif %}
           </span>
         </dd>
-        <dt>DST 处理</dt><dd>{{ plan_view.dst_label }}</dd>
-        <dt>设置的 HH:MM</dt><dd>{{ plan_view.check_time }}</dd>
+        <dt>DST 处理</dt><dd>{{ production.plan.dst_label }}</dd>
+        <dt>设置的 HH:MM</dt><dd>{{ production.plan.check_time }}</dd>
       </dl>
     {% else %}
       <p class="muted">当天计划尚未生成。</p>
     {% endif %}
-  </section>
 
-  <section class="card">
-    <h2>当天结果（同一当地日期仅保留一份）</h2>
-    {% if result_view %}
+    <h3>当天结果（同一当地日期仅保留一份）</h3>
+    {% if production.result %}
       <dl>
-        <dt>计划时间</dt><dd>{{ result_view.planned_local }}</dd>
-        <dt>完成时间</dt><dd>{{ result_view.finished_local }}</dd>
-        {% if result_view.error %}
-          <dt>读盘错误</dt><dd><span class="pill error">错误</span> {{ result_view.error }}</dd>
+        <dt>计划时间</dt><dd>{{ production.result.planned_local }}</dd>
+        <dt>完成时间</dt><dd>{{ production.result.finished_local }}</dd>
+        {% if production.result.error %}
+          <dt>读盘错误</dt><dd><span class="pill error">错误</span> {{ production.result.error }}</dd>
         {% else %}
-          <dt>实际可用字节数</dt><dd><strong>{{ "{:,}".format(result_view.available_bytes) }}</strong> bytes</dd>
+          <dt>实际可用字节数</dt><dd><strong>{{ "{:,}".format(production.result.available_bytes) }}</strong> bytes</dd>
         {% endif %}
       </dl>
     {% else %}
-      <p class="muted">当天暂无巡检结果。</p>
+      <p class="muted">当天暂无正式巡检结果。</p>
     {% endif %}
   </section>
 
-  <section class="card">
-    <h2>演练时钟控制</h2>
+  {% if drill %}
+  <section class="card drill">
+    <h2>本场演练（与正式巡检完全隔离）</h2>
+    <dl>
+      <dt>演练纽约时间</dt>
+      <dd>{{ drill.status.now_ny.strftime('%Y-%m-%d %H:%M:%S %Z (UTC%z)') }}</dd>
+      <dt>本场时钟偏移</dt>
+      <dd>{{ drill.clock_offset_seconds | round(0) | int }} 秒
+        {% if drill.clock_offset_seconds != 0 %}
+          <form class="inline" method="post" action="{{ url_for('clock_reset') }}" style="margin-left:8px">
+            <button class="secondary" type="submit">恢复真实时间</button>
+          </form>
+        {% endif %}
+      </dd>
+    </dl>
+
+    <h3>本场巡检时刻</h3>
+    <form method="post" action="{{ url_for('drill_update_check_time') }}">
+      <input type="time" name="check_time" value="{{ drill.status.check_time }}" required>
+      <button type="submit">保存本场时刻</button>
+    </form>
+
+    <h3>演练时钟控制</h3>
     <form method="post" action="{{ url_for('clock_set') }}" style="margin-bottom:10px">
       <input type="text" name="utc_time" placeholder="设定到 UTC 时刻，如 2026-03-08T13:00" size="34">
       <button type="submit">设定时钟</button>
@@ -130,15 +172,47 @@
       <input type="number" step="any" name="seconds" placeholder="推进秒数" required>
       <button type="submit">推进时钟</button>
     </form>
+
+    <h3>本场计划（{{ drill.status.today }}）</h3>
+    {% if drill.plan %}
+      <dl>
+        <dt>计划时刻（当地）</dt>
+        <dd>{{ drill.plan.planned_local }}
+          <span class="pill {{ drill.plan.status }}">
+            {% if drill.status.reading %}读盘中{% else %}{{ drill.plan.status_label }}{% endif %}
+          </span>
+        </dd>
+        <dt>DST 处理</dt><dd>{{ drill.plan.dst_label }}</dd>
+        <dt>设置的 HH:MM</dt><dd>{{ drill.plan.check_time }}</dd>
+      </dl>
+    {% else %}
+      <p class="muted">本场计划尚未生成。</p>
+    {% endif %}
+
+    <h3>本场读盘结果</h3>
+    {% if drill.result %}
+      <dl>
+        <dt>计划时间</dt><dd>{{ drill.result.planned_local }}</dd>
+        <dt>完成时间</dt><dd>{{ drill.result.finished_local }}</dd>
+        {% if drill.result.error %}
+          <dt>读盘错误</dt><dd><span class="pill error">错误</span> {{ drill.result.error }}</dd>
+        {% else %}
+          <dt>实际可用字节数</dt><dd><strong>{{ "{:,}".format(drill.result.available_bytes) }}</strong> bytes</dd>
+        {% endif %}
+      </dl>
+    {% else %}
+      <p class="muted">本场暂无读盘结果。</p>
+    {% endif %}
   </section>
+  {% endif %}
 
   <section class="card">
-    <h2>最近巡检记录</h2>
-    {% if st.recent %}
+    <h2>最近正式巡检记录</h2>
+    {% if production.status.recent %}
       <table>
         <thead><tr><th>当地日期</th><th>计划时间（当地）</th><th>状态</th><th>可用字节 / 错误</th></tr></thead>
         <tbody>
-        {% for r in st.recent %}
+        {% for r in production.status.recent %}
           <tr>
             <td>{{ r.local_date }}</td>
             <td>{{ r.check_time }}</td>
